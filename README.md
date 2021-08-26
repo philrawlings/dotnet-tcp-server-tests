@@ -5,7 +5,6 @@ A number of trials to determine the optimum way to write a TCP Server, handling 
 ![TCP Message](tcp-message.png?raw=true "TCP Message")
 
 ## Servers
-----
 
 ### **CircularBufferServer**
 
@@ -30,7 +29,6 @@ Uses System.IO.Pipelines, which does allow cancellation. Might not be doing buff
 Not perfect anyway since socket.Accept isnt cancellable anyway.
 
 ## Testing
-----
 
 - Run tests in test project, which fires off each server individually and uses TcpClient to send data to it
 
@@ -39,5 +37,5 @@ OR
 - Run TcpServerTest.Host and then run the LabVIEW Client Test VI.
 
 ## Conclusion
----
+
 From a code cleanliness and readbility perspective, `NetworkStreamAsyncServer` will be the way to go, once Cancellable socket methods are available in .NET6. 
