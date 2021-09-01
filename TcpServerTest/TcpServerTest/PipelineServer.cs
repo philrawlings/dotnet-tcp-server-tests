@@ -1,13 +1,9 @@
 ﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
-using System.Collections.Generic;
-using System.IO;
 using System.IO.Pipelines;
-using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -32,36 +28,45 @@ namespace TcpServerTest
             var pipe = new Pipe();
             Task pipeWriter = FillPipeAsync(socket, pipe.Writer); // Runs a task filling the pipe
 
+            Memory<byte> receiveBuffer = new byte[1024];            // Memory, not Span, so it's async compatible
+            ArrayBufferWriter<byte> transmitBuffer = new(1024);     // IBufferWriter has a nice API
+
             try
             {
                 while (true)
                 {
-                    var result = await pipe.Reader.ReadAsync(cancellationToken);
-                    if (result.Buffer.Length >= 2)
+                    var pipeBuffer = await pipe.Reader.ReadAsync(cancellationToken);
+                    if (pipeBuffer.Buffer.Length >= 2)
                     {
-                        var readBuffer = result.Buffer.Slice(0, 2).ToArray();
-                        var msgLen = BinaryPrimitives.ReadUInt16BigEndian(readBuffer);
+                        pipeBuffer.Buffer.Slice(0, 2).CopyTo(receiveBuffer.Span);
+                        var payloadLen = BinaryPrimitives.ReadUInt16BigEndian(receiveBuffer.Span.Slice(0, 2));
+                        var msgLen = 2 + payloadLen;
 
-                        if (result.Buffer.Length >= 2 + msgLen)
+                        if (pipeBuffer.Buffer.Length >= msgLen)
                         {
-                            var msgSeq = result.Buffer.Slice(0, 2 + msgLen);
-                            readBuffer = msgSeq.ToArray();
-                            var response = await Task.FromResult(ProcessMessage(readBuffer, msgLen)); // Have to process in non-async methods as Span<T> not allowed in async method - compile error
-
-                            pipe.Reader.AdvanceTo(msgSeq.End);
-
-                            socket.Send(response);
+                            pipeBuffer.Buffer.Slice(0, msgLen).CopyTo(receiveBuffer.Span);      // Copy the ReadOnlySequence into a more managable Memory buffer
+                            var msg = receiveBuffer.Slice(0, msgLen);                           // Get Memory slice with the exact length of the message
+                            if (TryProcessMessage(msg, transmitBuffer))                         // TryProcessMessage isn't doing any IO or heavy computation so don't really need to make it awaitable
+                            {
+                                socket.Send(transmitBuffer.WrittenSpan);
+                            }
+                            transmitBuffer.Clear();
+                            pipe.Reader.AdvanceTo(pipeBuffer.Buffer.Slice(0, msgLen).End);
                         }
                         else
                         {
-                            pipe.Reader.AdvanceTo(result.Buffer.Start); // Dont advance
+                            pipe.Reader.AdvanceTo(pipeBuffer.Buffer.Start); // Dont advance
                         }
                     }
                     else
                     {
-                        pipe.Reader.AdvanceTo(result.Buffer.Start); // Dont advance
+                        pipe.Reader.AdvanceTo(pipeBuffer.Buffer.Start); // Dont advance
                     }
                 }
+            }
+            catch(Exception e)
+            {
+
             }
             finally
             {
@@ -72,40 +77,32 @@ namespace TcpServerTest
             }
         }
 
-        private static byte[] ProcessMessage(byte[] readBuffer, ushort msgLen)
-        {
-            var msg = new Span<byte>(readBuffer);
 
+        private static bool TryProcessMessage(ReadOnlyMemory<byte> msg, IBufferWriter<byte> writeBuffer)
+        {
             // Full message received
-            var msgID = BinaryPrimitives.ReadUInt16BigEndian(msg.Slice(2, 2));
-            var msgVersion = msg[4];
+            var msgID = BinaryPrimitives.ReadUInt16BigEndian(msg.Span.Slice(2, 2));
+            var msgVersion = msg.Span.Slice(4, 1);
 
             if (msgID == 0x1)
             {
-                var ipv4Address = new IPAddress(msg.Slice(5, 4));
-                var ipv6Address = new IPAddress(msg.Slice(9, 16));
-                var port = BinaryPrimitives.ReadUInt16BigEndian(msg.Slice(25, 2));
+                var ipv4Address = new IPAddress(msg.Span.Slice(5, 4));
+                var ipv6Address = new IPAddress(msg.Span.Slice(9, 16));
+                var port = BinaryPrimitives.ReadUInt16BigEndian(msg.Span.Slice(25, 2));
 
                 // Build response (duplicate of message, regenerating content from parsed data rather than just socket.Send(msg) 
-                byte[] response = new byte[2 + msgLen];
-                BinaryPrimitives.WriteUInt16BigEndian(response, msgLen);
-
-                var idData = new byte[2];
-                BinaryPrimitives.WriteUInt16BigEndian(idData, msgID);
-                Buffer.BlockCopy(idData, 0, response, 2, 2);
-
-                response[4] = msgVersion;
-                Buffer.BlockCopy(ipv4Address.GetAddressBytes(), 0, response, 5, 4);
-                Buffer.BlockCopy(ipv6Address.GetAddressBytes(), 0, response, 9, 16);
-                var portData = new byte[2];
-                BinaryPrimitives.WriteUInt16BigEndian(portData, port);
-                Buffer.BlockCopy(portData, 0, response, 25, 2);
-
-                return response;
+                BinaryPrimitives.WriteUInt16BigEndian(writeBuffer.GetSpan(2), (ushort)(msg.Length - 2)); writeBuffer.Advance(2);
+                BinaryPrimitives.WriteUInt16BigEndian(writeBuffer.GetSpan(2), msgID); writeBuffer.Advance(2);
+                writeBuffer.Write(msgVersion);
+                writeBuffer.Write(ipv4Address.GetAddressBytes());
+                writeBuffer.Write(ipv6Address.GetAddressBytes());
+                BinaryPrimitives.WriteUInt16BigEndian(writeBuffer.GetSpan(2), port); writeBuffer.Advance(2);
+                return true;
             }
             else
             {
-                throw new Exception("Bad command"); // Probably should return an error code in the response
+                return false;
+                //throw new Exception("Bad command"); // Probably should return an error code in the response
             }
         }
 
